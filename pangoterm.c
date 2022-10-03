@@ -113,11 +113,14 @@ typedef struct {
   VTermScreenCell cells[];
 } PangoTermScrollbackLine;
 
+bool use_ibus = false;
+
 struct PangoTerm {
   VTerm *vt;
   VTermScreen *vts;
 
-  // GtkIMContext *im_context;
+  // only one of these are used
+  GtkIMContext *im_context;
   IBusInputContext *ibuscontext;
 
   int mousemode;
@@ -963,8 +966,11 @@ static void repaint_phyrect(PangoTerm *pt, PhyRect ph_rect)
 
       if(draw_cursor) {
         GdkRectangle cursor_area = GDKRECTANGLE_FROM_PHYPOS_CELLS(pt, ph_pos, 1);
-        // gtk_im_context_set_cursor_location(pt->im_context, &cursor_area);
-        pt_ibus_set_cursor_location(pt, cursor_area);
+        if (use_ibus) {
+          pt_ibus_set_cursor_location(pt, cursor_area);
+        } else {
+          gtk_im_context_set_cursor_location(pt->im_context, &cursor_area);
+        }
 
         if (pt->cursor_shape != VTERM_PROP_CURSORSHAPE_BLOCK) {
             flush_pending(pt);
@@ -1467,6 +1473,17 @@ static void vscroll_delta(PangoTerm *pt, int delta)
 
 static gboolean pangoterm_keypress(PangoTerm *pt, guint keyval, guint keycode, GdkModifierType state);
 
+static void pt_commit_text(PangoTerm *pt, gchar *str)
+{
+  fprintf(stderr, "COMMIT %s\n", str);
+
+  term_push_string(pt, str, FALSE);
+
+  if(CONF_unscroll_on_key && pt->scroll_offs)
+    vscroll_delta(pt, -pt->scroll_offs);
+}
+
+
 // IBUS {{{
 static IBusBus *_bus;
 
@@ -1493,12 +1510,7 @@ _ibus_context_commit_text_cb (IBusInputContext *ibuscontext,
                               IBusText         *text,
                               PangoTerm    *pt)
 {
-  // fprintf(stderr, "very text: %s\n", text->text);
-
-  term_push_string(pt, text->text, FALSE);
-
-  if(CONF_unscroll_on_key && pt->scroll_offs)
-    vscroll_delta(pt, -pt->scroll_offs);
+  pt_commit_text(pt, text->text);
 }
 
 static void
@@ -1698,15 +1710,18 @@ static gboolean widget_keypress(GtkEventController *controller,  guint keyval,
 {
   PangoTerm *pt = user_data;
 
-  /* GtkIMContext will eat a Shift-Space and not tell us about shift.
-   * Also don't let IME eat any GDK_KEY_KP_ events
-   */
-  gboolean ret = (state & GDK_SHIFT_MASK && keyval == ' ') ? FALSE
-               : (keyval >= GDK_KEY_KP_Space && keyval <= GDK_KEY_KP_Divide) ? FALSE
-               : ibus_filter_keypress(pt, keyval, keycode, state, false);
+  if (use_ibus) {
 
-  if(ret)
-    return TRUE;
+    /* GtkIMContext will eat a Shift-Space and not tell us about shift.
+     * Also don't let IME eat any GDK_KEY_KP_ events
+     */
+    gboolean ret = (state & GDK_SHIFT_MASK && keyval == ' ') ? FALSE
+                 : (keyval >= GDK_KEY_KP_Space && keyval <= GDK_KEY_KP_Divide) ? FALSE
+                 : ibus_filter_keypress(pt, keyval, keycode, state, false);
+
+    if(ret)
+      return TRUE;
+  }
 
   return pangoterm_keypress(pt, keyval, keycode, state);
 
@@ -1837,7 +1852,10 @@ static gboolean pangoterm_keypress(PangoTerm *pt, guint keyval, guint keycode, G
 static gboolean widget_keyrelease(GtkEventController *controller,  guint keyval,
                                 guint keycode, GdkModifierType state, gpointer user_data) {
   PangoTerm *pt = user_data;
-  return ibus_filter_keypress(pt, keyval, keycode, state, true);
+  if (use_ibus) {
+    return ibus_filter_keypress(pt, keyval, keycode, state, true);
+  }
+  return FALSE;
 }
 
 static gboolean widget_mousepress(GtkGesture *gesture, gint n_press, gdouble x,
@@ -2085,13 +2103,7 @@ static gboolean widget_scroll(GtkEventController *scroll, gdouble dx, gdouble dy
 static gboolean widget_im_commit(GtkIMContext *context, gchar *str, gpointer user_data)
 {
   PangoTerm *pt = user_data;
-
-  printf("COMMIT %s\n", str);
-
-  term_push_string(pt, str, FALSE);
-
-  if(CONF_unscroll_on_key && pt->scroll_offs)
-    vscroll_delta(pt, -pt->scroll_offs);
+  pt_commit_text(pt, str);
 
   return FALSE;
 }
@@ -2232,8 +2244,12 @@ static void widget_focus_in(GtkWidget *widget, gpointer user_data)
     blit_dirty(pt);
   }
 
-  if (pt->ibuscontext) {
-    ibus_input_context_focus_in (pt->ibuscontext);
+  if (use_ibus) {
+    if (pt->ibuscontext) {
+      ibus_input_context_focus_in (pt->ibuscontext);
+    }
+  } else {
+    gtk_im_context_focus_in(pt->im_context);
   }
 }
 
@@ -2252,8 +2268,12 @@ static void widget_focus_out(GtkWidget *widget, gpointer user_data)
     flush_pending(pt);
     blit_dirty(pt);
   }
-  if (pt->ibuscontext) {
-    ibus_input_context_focus_out (pt->ibuscontext);
+  if (use_ibus) {
+    if (pt->ibuscontext) {
+      ibus_input_context_focus_out (pt->ibuscontext);
+    }
+  } else {
+    gtk_im_context_focus_in(pt->im_context);
   }
 
 }
@@ -2405,16 +2425,19 @@ PangoTerm *pangoterm_new(int rows, int cols)
   // with the X11/XIM flavoured IBus model. At all. This will all be fixed by
   // adopting the Wayland IME protocol through the entire stack, but we are not
   // there yet. Talk to IBus directly instead so we can fake the intended behavior.
-  // pt->im_context = gtk_im_multicontext_new();
-  // gtk_im_context_set_client_widget(pt->im_context, pt->termwin);
-  // gtk_im_context_set_use_preedit(pt->im_context, false);
 
-  // this is somehow not needed, and NOT inculding it implements shift-space properly???
-  // gtk_event_controller_key_set_im_context(GTK_EVENT_CONTROLLER_KEY(key_ev), pt->im_context);
+  if (use_ibus) {
+      ibus_connect_try(pt); // async
+  } else {
+      pt->im_context = gtk_im_multicontext_new();
+      gtk_im_context_set_client_widget(pt->im_context, pt->termda);
+      gtk_im_context_set_use_preedit(pt->im_context, false);
 
-  // g_signal_connect(G_OBJECT(pt->im_context), "commit", G_CALLBACK(widget_im_commit), pt);
+      gtk_event_controller_key_set_im_context(GTK_EVENT_CONTROLLER_KEY(key_ev), pt->im_context);
 
-  ibus_connect_try(pt); // async
+      g_signal_connect(G_OBJECT(pt->im_context), "commit", G_CALLBACK(widget_im_commit), pt);
+  }
+
 
   g_signal_connect(G_OBJECT(pt->termda), "resize", G_CALLBACK(widget_resize), pt);
 
